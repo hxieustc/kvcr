@@ -226,6 +226,7 @@ class _LocalDramPools:
         ):
             raise ValueError("local DRAM pools must not overlap")
         self._evictable = _EvictionQueue()
+        self._evictable_by_pool = {name: _EvictionQueue() for name in self._regions}
         self._evictable_slots: Counter[str] = Counter()
         self._unscored: set[BlockKey] = set()
         self._capacity_eviction_key: BlockKey | None = None
@@ -662,7 +663,14 @@ class _LocalDramPools:
 
         deficient = short()
         state = self._source_state
-        with closing(self._evictable.candidates(protected)) as candidates:
+        # Single-pool admissions need only candidates owning that pool. Mirror
+        # score changes in owner order to retain its global relative ranking.
+        queue = (
+            self._evictable_by_pool[next(iter(required))]
+            if len(required) == 1
+            else self._evictable
+        )
+        with closing(queue.candidates(protected)) as candidates:
             while deficient:
                 key = next(candidates, None)
                 if key is None:
@@ -753,9 +761,13 @@ class _LocalDramPools:
             evictable_slots = self._evictable_slots
             for pool, count in residency.pool_counts:
                 evictable_slots[pool] += count
+        for pool, _ in residency.pool_counts:
+            self._evictable_by_pool[pool].insert(key, score)
 
     def _remove_evictable(self, key: BlockKey, residency: _LocalDramResidency) -> None:
         self._unscored.discard(key)
+        for pool, _ in residency.pool_counts:
+            self._evictable_by_pool[pool].remove(key)
         if self._evictable.remove(key):
             evictable_slots = self._evictable_slots
             for pool, count in residency.pool_counts:

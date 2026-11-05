@@ -685,6 +685,92 @@ def test_group_allocation_evicts_enough_whole_keys(monkeypatch) -> None:
     ]
 
 
+def test_single_pool_admission_does_not_rescan_other_pools(monkeypatch) -> None:
+    unrelated = tuple(BlockKey(f"full{i}".encode()) for i in range(64))
+    pools = [ctypes.create_string_buffer(64 * 8), ctypes.create_string_buffer(8)]
+    source = ctypes.create_string_buffer(16)
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    kvcr = _two_pool_kvcr(agent, pools, source)
+    full, swa = _mem_descriptor(label="full"), _mem_descriptor(label="swa")
+    first = BlockKey(b"swa0")
+    operation = kvcr.deposit({**dict.fromkeys(unrelated, [full]), first: [swa]})
+    _poll_until(kvcr, lambda done: operation in dict(done))
+    pops = Mock(wraps=heapq.heappop)
+    monkeypatch.setattr(heapq, "heappop", pops)
+    previous = first
+    for i in range(1, 4):
+        key = BlockKey(f"swa{i}".encode())
+        operation = kvcr.deposit({key: [swa]})
+        result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))
+        assert result[operation][key].success
+        assert kvcr.query((previous, key)) == [
+            (QueryStatus.MISS, None), (QueryStatus.HIT, CacheTier.LOCAL_G2)
+        ]
+        previous = key
+    assert kvcr.query(unrelated) == [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 64
+    # One victim and at most one stale tuple per admission, independent of
+    # the older keys belonging only to the other physical pool.
+    assert pops.call_count <= 6
+
+
+@pytest.mark.parametrize("policy", [FIFOPolicy(), LRUPolicy()], ids=["fifo", "lru"])
+def test_pool_index_preserves_global_rank_through_claims_and_churn(policy) -> None:
+    agent = FakeNixlAgent()
+    agent.state = "DONE"
+    buffers = [ctypes.create_string_buffer(24) for _ in range(2)]
+    source = ctypes.create_string_buffer(16)
+    kvcr = _two_pool_kvcr(agent, buffers, source)
+    kvcr._core._policy = _PolicyInvoker(policy)
+    pools = kvcr._core._local_dram._pools
+    descriptors = [_mem_descriptor(label="full"), _mem_descriptor(label="swa")]
+    full, swa, mixed = (BlockKey(k) for k in (b"full", b"swa", b"mixed"))
+
+    def check():
+        global_order = sorted(pools._evictable._live.values())
+        for pool, queue in pools._evictable_by_pool.items():
+            expected = [
+                (score, key)
+                for score, _, key in global_order
+                if pool in dict(kvcr._core._block_record_map[key].local_dram.pool_counts)
+            ]
+            actual = [(score, key) for score, _, key in sorted(queue._live.values())]
+            assert actual == expected
+
+    operation = kvcr.deposit(
+        {full: descriptors[:1], swa: descriptors[1:], mixed: descriptors}
+    )
+    _poll_until(kvcr, lambda done: operation in dict(done))
+    check()
+    # FIFO forces equal scores; unchanged-score refresh must retain tie order.
+    for key in (mixed, full, swa, mixed):
+        pools._make_evictable(key)
+        check()
+    operation = kvcr.fetch((mixed,), expected_layout=["full", "swa"])
+    result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))
+    claim = result[operation][mixed]
+    assert claim.success
+    check()
+    assert kvcr.release([claim.release_handle])[0][1]
+    check()
+    for i in range(12):
+        pool = ("full", "swa")[i % 2]
+        victim = None
+        if not pools._free_slots[pool]:
+            victim = next(
+                key for _, _, key in sorted(pools._evictable._live.values())
+                if pool in dict(kvcr._core._block_record_map[key].local_dram.pool_counts)
+            )
+        operation = kvcr.deposit(
+            {BlockKey(f"new{i}".encode()): descriptors[i % 2 : i % 2 + 1]}
+        )
+        result = dict(_poll_until(kvcr, lambda done: operation in dict(done)))
+        assert next(iter(result[operation].values())).success
+        if victim is not None:
+            assert kvcr.query((victim,)) == [(QueryStatus.MISS, None)]
+        check()
+
+
 def test_eviction_heap_compaction_preserves_active_candidates() -> None:
     queue = _EvictionQueue()
     first, churned, excluded = (
