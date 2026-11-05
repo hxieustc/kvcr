@@ -746,7 +746,7 @@ class _KVCRProgress:
             self._nixl_agent = nixl_agent(
                 self._nixl_agent_name,
                 nixl_agent_config(
-                    num_threads=4,
+                    num_threads=0,
                     capture_telemetry=True,
                     enable_listen_thread=True,
                     listen_port=self._nixl_listen_port,
