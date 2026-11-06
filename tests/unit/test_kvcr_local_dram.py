@@ -853,6 +853,7 @@ def test_source_access_does_not_credit_reused_slots(replacement):
         SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
         FakeBytesControl(),
         local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+        policy=LRUPolicy(),
     )
     key, live = BlockKey(b"resident"), BlockKey(b"live")
     install_recovery_records(
@@ -882,13 +883,18 @@ def test_source_access_does_not_credit_reused_slots(replacement):
     kvcr._core._clock = lambda: 7.0
     local._drain_source_completions()
     assert (live_record.access_count, live_record.last_access) == (1, 7.0)
+    assert local._evictable.score(live) == 7.0
     assert old.source_readers == 0
     if replacement is not None:
         assert (new_record.access_count, new_record.last_access) == (0, None)
+        assert local._evictable.score(replacement) == -1.0
         assert new.source_readers == 1
         assert local._source_state.active[replacement] is new
         local.release_readers((replacement,), (new,), success=False)
         local._drain_source_completions()
+        slots, evicted, pending = local._allocate_slots([""], frozenset(), 1.0)
+        assert slots == [("", 0)] and evicted == [replacement] and not pending
+        local._free(slots)
     assert local._source_state.active == {}
     assert local.source_operations == 0
 
