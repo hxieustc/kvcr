@@ -153,6 +153,9 @@ def test_framework_pinning_disabled(keys, completed_indices, source_case, kvcr_c
     }
     if completed_indices:
         assert agent.xfers[-1][3] == [(128 + 16 * completed_indices[0], 16, 0)]
+        local = source._core._local_dram._pools
+        _wait_until(lambda: local.source_operations == 0)
+        assert source._core._block_record_map[b"local"].local_dram.source_readers == 0
     _poll_until(source, lambda _: not _has_outstanding_operations(source))
     source.close()
     assert "framework pin result polling failed" not in kvcr_caplog.text
@@ -842,10 +845,15 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
 
 
 @pytest.mark.parametrize("failure", ["initialize", "error", "exception", "async"])
-@pytest.mark.parametrize("local_source", [False, True], ids=["framework", "local"])
+@pytest.mark.parametrize(
+    "local_source,framework_pinning",
+    [(False, True), (True, True), (True, False)],
+    ids=["framework", "local", "local-no-pin"],
+)
 def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
     failure: str,
     local_source: bool,
+    framework_pinning: bool,
 ) -> None:
     """Every source-transfer failure reports failure and releases its state."""
 
@@ -862,7 +870,13 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
             return "PROC" if failure == "async" else "ERR"
 
     source_agent = FailingTransferAgent(metadata=b"source-md")
-    pinning = FakePrimaryPinning()
+    pinning = (
+        FakePrimaryPinning()
+        if framework_pinning
+        else SimpleNamespace(
+            request_pin=None, poll_pin_results=None, release_pin=None, unpins=[]
+        )
+    )
     control = FakeBytesControl()
     key = BlockKey(b"k0")
     memory = ctypes.create_string_buffer(16)
@@ -1103,10 +1117,16 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_sou
 
 
 @pytest.mark.parametrize(
-    "mixed,framework_pinning", [(False, False), (False, True), (True, True)]
+    "mixed,framework_pinning,shutdown",
+    [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (True, True, False),
+    ],
 )
 def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
-    mixed, framework_pinning
+    mixed, framework_pinning, shutdown
 ):
     now = 0.0
     memory = ctypes.create_string_buffer(16)
@@ -1159,6 +1179,10 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
         ]
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count + residency.source_readers == 1
+        if shutdown:
+            source._core._progress._submissions.put(_STOP)
+            _wait_until(lambda: source._core._progress._startup_stage == "cleanup")
+            assert residency.source_readers == 1
         agent.state = "DONE"
         if not framework_pinning:
             local = source._core._local_dram._pools
@@ -1166,17 +1190,21 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
             # Native completion releases protection without another owner poll.
             assert residency.source_readers == 0
             assert local._reclaimable_slots() == {"": 1}
-        assert _poll_until(source, lambda _: len(errors) == 2) == []
+        if shutdown:
+            source.close()
+        else:
+            assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert residency.claim_count + residency.source_readers == 0
         assert errors[1].source_blocks == expected_sources
         for error in errors:
             assert error.source_owners == expected_owners
             assert error.destination_regions is error.destination_owner is None
-        deposit = source.deposit({replacement: [descriptor]})
-        assert _poll_until(source, bool) == [
-            (deposit, _op_entries({replacement: True}))
-        ]
+        if not shutdown:
+            deposit = source.deposit({replacement: [descriptor]})
+            assert _poll_until(source, bool) == [
+                (deposit, _op_entries({replacement: True}))
+            ]
     finally:
         agent.state = "DONE"
         source.close()

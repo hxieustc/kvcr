@@ -802,8 +802,9 @@ def test_builtin_policy_eviction_order(
 
 
 @pytest.mark.parametrize("framework_pinning", [False, True])
-def test_failed_source_quiescence_releases_readers_before_owner_drain(
-    framework_pinning,
+@pytest.mark.parametrize("success", [False, True])
+def test_source_quiescence_releases_readers_before_owner_drain(
+    framework_pinning, success
 ):
     memory = ctypes.create_string_buffer(16)
     pinning = (
@@ -825,12 +826,12 @@ def test_failed_source_quiescence_releases_readers_before_owner_drain(
     assert local.acquire_readers((key,), destination, ())
     assert local.acquire_readers((key,), destination, ())
 
-    local.release_readers((key,), (residency,), success=False)
+    local.release_readers((key,), (residency,), success=success)
     assert residency.source_readers == (2 if framework_pinning else 1)
     assert local._reclaimable_slots() == {"": 0}
     assert local._allocate_slots([""], frozenset(), 1.0) == (None, [], False)
 
-    local.release_readers((key,), (residency,), success=False)
+    local.release_readers((key,), (residency,), success=success)
     assert local.source_operations == 0
     assert residency.source_readers == (2 if framework_pinning else 0)
     assert local._reclaimable_slots() == {"": 0 if framework_pinning else 1}
@@ -841,6 +842,87 @@ def test_failed_source_quiescence_releases_readers_before_owner_drain(
 
     local._drain_source_completions()
     assert residency.source_readers == 0
+    assert local._source_state.active == {}
+
+
+@pytest.mark.parametrize("replacement", [None, b"other", b"resident"])
+def test_source_access_does_not_credit_reused_slots(replacement):
+    memory = ctypes.create_string_buffer(32)
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        FakeBytesControl(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    key, live = BlockKey(b"resident"), BlockKey(b"live")
+    install_recovery_records(
+        kvcr._core,
+        {key: _recovered_record(g2=[("", 0)]), live: _recovered_record(g2=[("", 1)])},
+    )
+    local = kvcr._core._local_dram._pools
+    old = kvcr._core._block_record_map[key].local_dram
+    live_record = kvcr._core._block_record_map[live]
+    destinations = ((progress_module._TransferRef("target", 0),),) * 2
+    claims = local.acquire_readers((key, live), destinations, ())
+    local.release_readers((key, live), tuple(row[1] for row in claims), success=True)
+    slots, evicted, pending = local._allocate_slots([""], frozenset((live,)), 1.0)
+    assert slots == [("", 0)] and evicted == [key] and not pending
+    if replacement is None:
+        local._free(slots)
+    else:
+        new = _LocalDramResidency(tuple(slots), _LocalDramState.READY)
+        assert new == old and new is not old
+        new_record = _BlockRecord(local_dram=new)
+        kvcr._core._block_record_map[replacement] = new_record
+        local._publish_source(replacement, new)
+        local._make_evictable(replacement)
+        # A new read of a same-key replacement must survive draining the old read.
+        assert local.acquire_readers((replacement,), destinations[:1], ())
+
+    kvcr._core._clock = lambda: 7.0
+    local._drain_source_completions()
+    assert (live_record.access_count, live_record.last_access) == (1, 7.0)
+    assert old.source_readers == 0
+    if replacement is not None:
+        assert (new_record.access_count, new_record.last_access) == (0, None)
+        assert new.source_readers == 1
+        assert local._source_state.active[replacement] is new
+        local.release_readers((replacement,), (new,), success=False)
+        local._drain_source_completions()
+    assert local._source_state.active == {}
+    assert local.source_operations == 0
+
+
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_source_quiescence_defers_retirement_to_owner(drain_first):
+    memory = ctypes.create_string_buffer(16)
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None),
+        FakeBytesControl(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    key = BlockKey(b"retiring")
+    install_recovery_records(kvcr._core, {key: _recovered_record(g2=[("", 0)])})
+    local = kvcr._core._local_dram._pools
+    record = kvcr._core._block_record_map[key]
+    residency = record.local_dram
+    destination = ((progress_module._TransferRef("target", 0),),)
+    assert local.acquire_readers((key,), destination, ())
+    assert local.acquire_sources((key,))
+    local.retire_sources((key,))
+    local.release_readers((key,), (residency,), success=True)
+    assert residency.source_readers == 0
+    assert not local._free_slots[""]
+    if drain_first:
+        local._drain_source_completions()
+        assert record.local_dram is residency
+    local.release_sources((key,))
+    # Closing drains any remaining completion without crediting a retired row.
+    kvcr.close()
+    assert (record.access_count, record.last_access) == (0, None)
+    assert key not in kvcr._core._block_record_map
+    assert list(local._free_slots[""]) == [0]
     assert local._source_state.active == {}
 
 

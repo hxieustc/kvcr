@@ -349,9 +349,9 @@ class _LocalDramPools:
         *,
         success: bool,
     ) -> None:
-        """Release quiesced failed reads; defer owner accounting and reclamation."""
+        """End quiesced DMA protection; defer owner accounting and reclamation."""
         state = self._source_state
-        released = self._kvcr._request_pin_callback is None and not success
+        released = self._kvcr._request_pin_callback is None
         with state.lock:
             if released:
                 for key, residency in zip(keys, sources):
@@ -380,7 +380,22 @@ class _LocalDramPools:
                 except queue.Empty:
                     break
                 if success:
-                    self._kvcr._record_access(keys)
+                    # Quiesced slots may already have been reused, even for the
+                    # same key. Access credit belongs only to the read residency.
+                    accessed = (
+                        tuple(
+                            key
+                            for key, residency in zip(keys, sources)
+                            if (record := self._kvcr._block_record_map.get(key))
+                            is not None
+                            and record.local_dram is residency
+                            and not residency.retire_on_release
+                        )
+                        if released
+                        else keys
+                    )
+                    if accessed:
+                        self._kvcr._record_access(accessed)
                 if not released:
                     with state.lock:
                         for key, residency in zip(keys, sources):
