@@ -90,7 +90,7 @@ class _LocalDramResidency(msgspec.Struct, gc=False, eq=False):
     _layout: tuple[str, ...] | None = None
     _pool_counts: tuple[tuple[str, int], ...] | None = None
     _cached_size: int | None = None
-    source_readers: int = 0  # Includes completed reads awaiting access accounting.
+    source_readers: int = 0  # Framework-pinned reads include deferred accounting.
 
     def __post_init__(self) -> None:
         self.slots = tuple(self.slots)
@@ -183,7 +183,7 @@ class _SourceState:
         self.active: dict[BlockKey, _LocalDramResidency] = {}
         self.operations = 0
         self.completions: queue.SimpleQueue[
-            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool]
+            tuple[tuple[BlockKey, ...], tuple[_LocalDramResidency, ...], bool, bool]
         ] = queue.SimpleQueue()
 
 
@@ -349,11 +349,22 @@ class _LocalDramPools:
         *,
         success: bool,
     ) -> None:
-        """Queue reader release; retain eviction protection until access accounting."""
+        """Release quiesced failed reads; defer owner accounting and reclamation."""
         state = self._source_state
+        released = self._kvcr._request_pin_callback is None and not success
         with state.lock:
+            if released:
+                for key, residency in zip(keys, sources):
+                    if (
+                        residency.source_readers <= 0
+                        or state.active.get(key) is not residency
+                    ):
+                        raise RuntimeError("local DRAM source reader ownership lost")
+                    residency.source_readers -= 1
+                    if not residency.source_readers:
+                        state.active.pop(key)
             state.operations -= 1
-            state.completions.put((keys, sources, success))
+            state.completions.put((keys, sources, success, released))
 
     def _drain_source_completions(self) -> None:
         if self._draining_source_completions:
@@ -365,20 +376,24 @@ class _LocalDramPools:
         try:
             while True:
                 try:
-                    keys, sources, success = completions.get_nowait()
+                    keys, sources, success, released = completions.get_nowait()
                 except queue.Empty:
                     break
                 if success:
                     self._kvcr._record_access(keys)
-                with state.lock:
-                    for key, residency in zip(keys, sources):
-                        if residency.source_readers <= 0:
-                            raise RuntimeError(
-                                "local DRAM source reader ownership lost"
-                            )
-                        residency.source_readers -= 1
-                        if not residency.source_readers:
-                            state.active.pop(key)
+                if not released:
+                    with state.lock:
+                        for key, residency in zip(keys, sources):
+                            if (
+                                residency.source_readers <= 0
+                                or state.active.get(key) is not residency
+                            ):
+                                raise RuntimeError(
+                                    "local DRAM source reader ownership lost"
+                                )
+                            residency.source_readers -= 1
+                            if not residency.source_readers:
+                                state.active.pop(key)
                 for key, residency in zip(keys, sources):
                     record = self._kvcr._block_record_map.get(key)
                     if (

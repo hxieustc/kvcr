@@ -1102,15 +1102,25 @@ def test_source_lifecycles_distinguish_targets_reusing_the_same_handle(local_sou
         source.close()
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
+@pytest.mark.parametrize(
+    "mixed,framework_pinning", [(False, False), (False, True), (True, True)]
+)
+def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(
+    mixed, framework_pinning
+):
     now = 0.0
     memory = ctypes.create_string_buffer(16)
     descriptor = _mem_descriptor(end_point_name="source")
     agent, control, errors = FakeNixlAgent(), FakeBytesControl(), []
     source = _new_kvcr(
         agent,
-        FakePrimaryPinning(missing_indices=(0,)),
+        (
+            FakePrimaryPinning(missing_indices=(0,))
+            if framework_pinning
+            else SimpleNamespace(
+                request_pin=None, poll_pin_results=None, release_pin=None
+            )
+        ),
         control,
         name="source",
         on_resilience_event=errors.append,
@@ -1150,6 +1160,12 @@ def test_abandoned_source_keeps_local_slot_claimed_until_quiescence(mixed):
         residency = source._core._block_record_map[key].local_dram
         assert residency.claim_count + residency.source_readers == 1
         agent.state = "DONE"
+        if not framework_pinning:
+            local = source._core._local_dram._pools
+            _wait_until(lambda: local.source_operations == 0)
+            # Native completion releases protection without another owner poll.
+            assert residency.source_readers == 0
+            assert local._reclaimable_slots() == {"": 1}
         assert _poll_until(source, lambda _: len(errors) == 2) == []
         assert [error.state for error in errors] == ["uncertain", "quiesced"]
         assert residency.claim_count + residency.source_readers == 0

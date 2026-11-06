@@ -801,6 +801,49 @@ def test_builtin_policy_eviction_order(
         kvcr.release((second_claim,))
 
 
+@pytest.mark.parametrize("framework_pinning", [False, True])
+def test_failed_source_quiescence_releases_readers_before_owner_drain(
+    framework_pinning,
+):
+    memory = ctypes.create_string_buffer(16)
+    pinning = (
+        FakePrimaryPinning()
+        if framework_pinning
+        else SimpleNamespace(request_pin=None, poll_pin_results=None, release_pin=None)
+    )
+    kvcr = _new_kvcr(
+        FakeNixlAgent(),
+        pinning,
+        FakeBytesControl(),
+        local_dram=LocalDramOptions([("", ctypes.addressof(memory), len(memory))]),
+    )
+    key = BlockKey(b"resident")
+    install_recovery_records(kvcr._core, {key: _recovered_record(g2=[("", 0)])})
+    local = kvcr._core._local_dram._pools
+    residency = kvcr._core._block_record_map[key].local_dram
+    destination = ((progress_module._TransferRef("target", 0),),)
+    assert local.acquire_readers((key,), destination, ())
+    assert local.acquire_readers((key,), destination, ())
+
+    local.release_readers((key,), (residency,), success=False)
+    assert residency.source_readers == (2 if framework_pinning else 1)
+    assert local._reclaimable_slots() == {"": 0}
+    assert local._allocate_slots([""], frozenset(), 1.0) == (None, [], False)
+
+    local.release_readers((key,), (residency,), success=False)
+    assert local.source_operations == 0
+    assert residency.source_readers == (2 if framework_pinning else 0)
+    assert local._reclaimable_slots() == {"": 0 if framework_pinning else 1}
+    if not framework_pinning:
+        slots, evicted, pending = local._allocate_slots([""], frozenset(), 1.0)
+        assert slots == [("", 0)] and evicted == [key] and not pending
+        local._free(slots)
+
+    local._drain_source_completions()
+    assert residency.source_readers == 0
+    assert local._source_state.active == {}
+
+
 def test_eviction_preserves_reader_claimed_during_policy_decision(monkeypatch):
     primary = ctypes.create_string_buffer(b"a" * 16 + b"b" * 16, 32)
     memory = ctypes.create_string_buffer(16)
